@@ -1,0 +1,577 @@
+diff --git a/converter.py b/converter.py
+index 80152cb..3c15559 100644
+--- a/converter.py
++++ b/converter.py
+@@ -37,7 +37,7 @@ import threading
+ import time
+ import uuid
+ from pathlib import Path
+-from contextlib import asynccontextmanager
++from contextlib import asynccontextmanager, nullcontext as _nullcontext
+ from contextvars import ContextVar
+ from typing import Any, Optional
+ from urllib.parse import urlsplit
+@@ -57,6 +57,43 @@ except ImportError:  # 模块缺失时降级为不脱敏
+     def scan_messages(messages, roles=("system", "assistant")):
+         return []
+ 
++try:
++    from channel_guard import (
++        prepare_body as channel_prepare_body,
++        force_neutral_head as channel_force_neutral_head,
++        perturb as channel_perturb,
++        is_channel_reject as channel_is_reject,
++    )
++except ImportError:  # 模块缺失时全降级为 no-op
++    def channel_prepare_body(body):
++        return body
++
++    def channel_force_neutral_head(body):
++        return None
++
++    def channel_perturb(body, dense=False):
++        return None
++
++    def channel_is_reject(body_text):
++        return False
++
++# 11128 渠道门救援次数：二级（强制中性头）→ 三级（稀疏扰动）→ 三级密集扰动。
++# 与 failover 重试预算**分开计**——渠道门拒绝的是"这份请求"，不是账号，
++# 切号救不了（换账号发同样的字节还是被拒），所以必须重发改写后的 body。
++_CHANNEL_RESCUE_LEVELS = 3
++
++
++def _channel_rescue_body(body, level):
++    """按救援级别改写 body。level 1..3；改不动时返回 None（不浪费一次请求）。"""
++    if level == 1:
++        return channel_force_neutral_head(body)
++    if level == 2:
++        return channel_perturb(body, dense=False)
++    if level == 3:
++        return channel_perturb(body, dense=True)
++    return None
++
++
+ try:
+     from anthropic_compat import (
+         translate_anthropic_request,
+@@ -114,6 +151,33 @@ except ImportError:
+ BACKEND = "https://copilot.tencent.com"
+ DEFAULT_DOMAIN = "www.codebuddy.cn"
+ 
++# 国际版（workbuddy.ai）与国内版（codebuddy.cn）是**两套独立账号体系**：
++# 各自的 token、计费、模型清单都互不相通。把国际版 token 发到国内版后端
++# （copilot.tencent.com）会被上游 APISIX 挡下，返回
++#   HTTP 401 Unauthorized + APISIX 的 HTML 错误页
++# 而不是 JSON 错误体。账号池里同时存在两种域名的账号时，调度必须按域名分区，
++# 否则 failover 会切到"域名对不上"的账号上，整单 401。
++# 参考 RobbsLuo/Coding2API：国内站 copilot.tencent.com，国际站 www.codebuddy.ai。
++INTL_DOMAINS = ("workbuddy.ai", "codebuddy.ai")
++
++
++def _account_domain(session: dict) -> str:
++    """取账号的 domain（缺失时按国内版默认）。"""
++    if not isinstance(session, dict):
++        return DEFAULT_DOMAIN
++    auth = session.get("auth") or {}
++    return str(auth.get("domain") or DEFAULT_DOMAIN).strip().lower() or DEFAULT_DOMAIN
++
++
++def _domain_region(domain: str) -> str:
++    """域名 → 区域标记：'intl' 或 'cn'。"""
++    d = (domain or "").lower()
++    return "intl" if any(x in d for x in INTL_DOMAINS) else "cn"
++
++
++# 网关当前后端所属区域。选号时只允许同区域的账号。
++_BACKEND_REGION = _domain_region(urlsplit(BACKEND).netloc)
++
+ # ---------------------------------------------------------------------------
+ # 平台相关：定位 auth 目录与 WSL 宿主穿透
+ # ---------------------------------------------------------------------------
+@@ -749,14 +813,53 @@ class CredentialManager:
+ 
+     def _build_headers_from(self, auth: dict, account: dict) -> dict:
+         domain = auth.get("domain") or DEFAULT_DOMAIN
++        uid = account.get("uid", "")
++        eid = account.get("enterpriseId", "")
++        # Origin/Referer 必须与凭据所属区域一致（参考 dsh-connect-workbuddy 的
++        # originReferer()：国内固定 www.codebuddy.cn，国际版用其自有域名）。
++        origin = f"https://{domain}" if "workbuddy.ai" in domain else "https://www.codebuddy.cn"
++        # 官方 CLI 的完整指纹头。清单来自 RobbsLuo/Coding2API 的
++        # src/provider/codebuddy/headers.py（MIT，2026-10 仍在跟进上游变化）。
++        # 渠道校验会看这批头：缺 X-Conversation-* 三元组、缺 x-stainless-* 系列、
++        # 缺 X-Agent-* 与 X-IDE-* 都会显著提高 11128 命中率。
++        host = urlsplit(BACKEND).netloc
+         h = {
+-            "Content-Type": "application/json",
+             "Accept": "application/json",
++            "X-Requested-With": "XMLHttpRequest",
++            "Origin": origin,
++            "Referer": origin + "/",
++            "Content-Type": "application/json",
+             "Authorization": f"Bearer {auth.get('accessToken','')}",
+-            "X-User-Id": account.get("uid", ""),
+-            "X-Enterprise-Id": account.get("enterpriseId", ""),
+-            "X-Tenant-Id": account.get("enterpriseId", ""),
+-            "X-Domain": domain,
++            # OpenAI JS SDK 指纹：官方 CLI 用 openai@js 发请求，上游校验这批头
++            "x-stainless-arch": "x64",
++            "x-stainless-lang": "js",
++            "x-stainless-os": "Linux",
++            "x-stainless-package-version": "6.25.0",
++            "x-stainless-retry-count": "0",
++            "x-stainless-runtime": "node",
++            "x-stainless-runtime-version": "v24.11.1",
++            # 官方的 X-No-* 约定：字段为空时发 X-No-<名字>: 1，而不是发空值
++            **({"X-User-Id": uid} if uid else {"X-No-User-Id": "1"}),
++            **({"X-Enterprise-Id": eid, "X-Tenant-Id": eid}
++               if eid else {"X-No-Enterprise-Id": "1"}),
++            **({"X-Domain": domain} if domain else {"X-No-Department-Info": "1"}),
++            "X-Product": "SaaS",
++            # ---- 会话身份三元组 ----
++            # 缺这三个头的 chat 请求会被 11128 拒（X-Conversation-Request-ID /
++            # Message-ID 官方是 32 位十六进制，不是带连字符的 uuid）。
++            "X-Conversation-ID": str(uuid.uuid4()),
++            "X-Conversation-Request-ID": uuid.uuid4().hex,
++            "X-Conversation-Message-ID": uuid.uuid4().hex,
++            "X-Request-ID": uuid.uuid4().hex,
++            # ---- 官方 CLI 的行为标注头 ----
++            "X-Agent-Intent": "craft",
++            "X-Agent-Purpose": "conversation",
++            "X-IDE-Type": "CLI",
++            "X-IDE-Name": "CLI",
++            "X-IDE-Version": "2.107.0",
++            "X-Private-Data": "false",
++            "X-CodeBuddy-Request": "1",
++            "Host": host,
+             "User-Agent": _get_user_agent(domain),
+         }
+         # 设备风控头：桌面端所有敏感请求均携带（Turing Shield SDK 生成）。
+@@ -818,6 +921,20 @@ class CredentialManager:
+         return self._build_headers_from(auth, account)
+ 
+     def switch_active_account(self, uid: str) -> bool:
++        # 区域门禁：**绝不**把 active_uid 切到与后端异区的账号。
++        # active_uid 是持久化状态（写进 accounts.json），一旦切到异区账号，
++        # 后续所有请求都会 401，且不会自动切回 —— 这是"网关突然全挂且不恢复"的
++        # 直接成因（实测：429 failover 切到国际号 → 401 → 永久错位）。
++        try:
++            _, accounts = _read_all_accounts()
++            session = accounts.get(uid)
++            if isinstance(session, dict):
++                region = _domain_region(_account_domain(session))
++                if region != _BACKEND_REGION:
++                    _log(f"⚠️ [切号门禁] 拒绝把 active_uid 切到异区账号 {uid[:8]}...（区域 {region} ≠ 后端 {_BACKEND_REGION}）")
++                    return False
++        except Exception:
++            pass          # 读不到就放行（Fail-Open），别因为读文件失败卡死切号
+         with self._lock:
+             ok = _set_active_account(uid)
+             if ok:
+@@ -1964,6 +2081,101 @@ class OriginGuardMiddleware:
+ 
+ _BODY_LIMIT_PATHS = frozenset({"/v1/chat/completions", "/v1/messages", "/v1/responses"})
+ 
++# ---------------------------------------------------------------------------
++# 请求来源标注（供用量日志归档，面板据此统计「请求来源 / 各来源消耗」）
++# ---------------------------------------------------------------------------
++#
++# 用 ContextVar 而不是改所有 `_record_usage` 调用点：用量记录发生在很深的
++# 调用链里（三个端点 × 流式/非流式 × 重试），逐个传参既啰嗦又容易漏。
++# 中间件在请求入口 set，`_record_usage` 读，请求结束自动 reset。
++_REQ_SOURCE: ContextVar = ContextVar("wb_req_source", default=None)
++
++
++def _client_label(ua: str) -> str:
++    """把 User-Agent 归一成可读的客户端名（面板按此分组）。
++
++    只做标识，不参与任何鉴权/拦截判断。
++    """
++    u = (ua or "").strip()
++    if not u:
++        return "(无 UA)"
++    low = u.lower()
++    # 顺序有意义：先匹配更具体的
++    for needle, label in (
++        ("deepseek-harness", "DSH"),
++        ("dsh", "DSH"),
++        ("claude-cli", "Claude Code"),
++        ("claude-code", "Claude Code"),
++        ("codex", "Codex CLI"),
++        ("hermes", "Hermes"),
++        ("openai-python", "Python SDK"),
++        ("openai-node", "Node SDK"),
++        ("httpx", "Python httpx"),
++        ("python-requests", "Python requests"),
++        ("aiohttp", "Python aiohttp"),
++        ("node-fetch", "Node fetch"),
++        ("undici", "Node undici"),
++        ("curl", "curl"),
++        ("postman", "Postman"),
++        ("insomnia", "Insomnia"),
++        ("cherry", "Cherry Studio"),
++        ("lobechat", "LobeChat"),
++        ("chatbox", "Chatbox"),
++        ("nextchat", "NextChat"),
++    ):
++        if needle in low:
++            return label
++    # 退化为 UA 的第一个 token（去掉版本号噪音）
++    head = u.split()[0].split("/")[0]
++    return head[:40] or "(未知)"
++
++
++class RequestSourceMiddleware:
++    """在请求入口记录来源（客户端 IP / 端点 / UA），只标注不拦截。
++
++    任何异常都吞掉：来源标注失败绝不能影响请求本身。
++    """
++
++    def __init__(self, app):
++        self.app = app
++
++    async def __call__(self, scope, receive, send):
++        if scope.get("type") != "http":
++            return await self.app(scope, receive, send)
++        token = None
++        try:
++            path = scope.get("path", "")
++            if path in _BODY_LIMIT_PATHS:      # 与请求体限流同一组 LLM 端点
++                headers = {}
++                for k, v in (scope.get("headers") or []):
++                    try:
++                        headers[k.decode("latin-1").lower()] = v.decode("latin-1")
++                    except Exception:
++                        continue
++                # 反向代理场景优先取转发头（tailnet / 内网直连时没有这些头）
++                ip = (headers.get("x-forwarded-for") or "").split(",")[0].strip() \
++                    or (headers.get("x-real-ip") or "").strip()
++                if not ip:
++                    client = scope.get("client") or ()
++                    ip = str(client[0]) if client else ""
++                token = _REQ_SOURCE.set({
++                    "client_ip": ip,
++                    "endpoint": path,
++                    "client": _client_label(headers.get("user-agent") or ""),
++                    "ua": (headers.get("user-agent") or "")[:120],
++                })
++        except Exception:
++            token = None
++        try:
++            return await self.app(scope, receive, send)
++        finally:
++            if token is not None:
++                try:
++                    _REQ_SOURCE.reset(token)
++                except Exception:
++                    pass
++
++
+ 
+ async def _send_413(send, path: str, size: int) -> None:
+     """向客户端下发标准 413 响应（OpenAI / Anthropic 两套错误体）。"""
+@@ -2056,6 +2268,7 @@ class RequestBodyLimitMiddleware:
+         return await self.app(scope, replay_receive, send)
+ 
+ 
++app.add_middleware(RequestSourceMiddleware)
+ app.add_middleware(LocalHostOnlyMiddleware)
+ app.add_middleware(RequestBodyLimitMiddleware)
+ # 最后注册 = 最外层（Starlette 后注册者先执行）：跨站请求在读取 body 之前就被拒绝
+@@ -2262,6 +2475,19 @@ def _record_usage(model: str, ok: bool, t0: float, *,
+             "retry_count": int(retry_count or 0),
+             "retry_reason": (_truncate(str(retry_reason), 100) if retry_reason else None),
+         }
++        # 请求来源（面板据此统计「来源 / 各来源消耗」）。取不到就省略这些键，
++        # 不要写 null —— 面板按「有无该键」区分「历史行」与「无来源」。
++        try:
++            _src = _REQ_SOURCE.get(None)
++            if _src:
++                if _src.get("client_ip"):
++                    rec["client_ip"] = _src["client_ip"]
++                if _src.get("endpoint"):
++                    rec["endpoint"] = _src["endpoint"]
++                if _src.get("client"):
++                    rec["client"] = _src["client"]
++        except Exception:
++            pass
+         if requested_model and requested_model != model:
+             rec["requested_model"] = requested_model
+             rec["actual_model"] = model
+@@ -2961,6 +3187,15 @@ _CREDIT_EXHAUSTED_CODES = {"14018"}
+ #    账号完成开通后应能恢复，绝不能按「额度耗尽」停到次日。
+ _ACCOUNT_FAULT_CODES = {"14017"}
+ 
++# ⑤ 上游 401（非 JSON，是 APISIX 的 HTML 错误页）：token 与后端区域不匹配。
++#    国内版与国际版是两套独立账号体系，跨区使用 token 会被上游网关挡下。
++#    这属于**账号态故障**（换号可自愈），不是限流，也不是用户错误。
++#    识别靠特征串而不是 code —— 这类响应根本不是 JSON。
++_UPSTREAM_401_MARKERS = (
++    "401 authorization required",
++    "powered by <a href=\"https://apisix.apache.org/",
++)
++
+ # ③ 每日额度码（TPD/RPD）：恢复边界是**日**而非小时，冷却须对齐上游 reset 墙钟，
+ #    无 reset 时才退化为保守按日；不得与瞬时频控共用 2h 封顶。
+ _DAILY_QUOTA_CODES = {"6004", "6008"}
+@@ -3080,16 +3315,21 @@ def _is_credit_exhausted_signal(status_code: int | None, err_text: str) -> bool:
+ 
+ 
+ def _is_account_fault_signal(status_code: int | None, err_text: str) -> bool:
+-    """判定「账号态故障」（14017：试用未激活 / 账号未完整开通）。
++    """判定「账号态故障」（14017：试用未激活 / 账号未完整开通 / 上游 401）。
+ 
+     与额度耗尽的区别（上游 client_test.go 锁定）：它是**账号状态**问题，短冷却 + 换号，
+     账号完成开通后即可恢复；按额度耗尽停到次日是错的（会白丢一个本可用的账号窗口）。
++
++    上游 401（APISIX HTML 页）也归到这里：token 与后端区域不匹配时上游直接 401，
++    换到同区账号即可恢复。注意它**不是 JSON**，所以只能靠特征串识别。
+     """
+     if status_code is not None and status_code < 400:
+         return False
+     text = (err_text or "").strip()
+     if not text:
+         return False
++    if _is_upstream_unauthorized(status_code, text):
++        return True
+     try:
+         data = json.loads(text)
+     except Exception:
+@@ -3102,6 +3342,22 @@ def _is_account_fault_signal(status_code: int | None, err_text: str) -> bool:
+     return _find_code_anywhere(data, _ACCOUNT_FAULT_CODES)
+ 
+ 
++def _is_upstream_unauthorized(status_code: int | None, err_text: str) -> bool:
++    """上游 401（APISIX HTML 错误页）判定。
++
++    特征：HTTP 401 + 非 JSON + 出现 APISIX/401 特征串。网关自己的鉴权 401
++    返回的是 JSON（`invalid api key`），不会命中这里。
++    """
++    if status_code != 401:
++        return False
++    text = (err_text or "").lower()
++    if not text:
++        return False
++    if text.lstrip().startswith("{"):
++        return False        # JSON 错误体 = 网关自身鉴权，不是上游
++    return any(m in text for m in _UPSTREAM_401_MARKERS)
++
++
+ def _next_day_reset_ms(hour: int = 0) -> tuple[int, str]:
+     """下一个「本地日边界」（UTC+8 的 hour:00）。兜底墙钟必须落在未来，否则顺延一天。
+ 
+@@ -3460,11 +3716,23 @@ class AccountRotator:
+         return []
+ 
+     def get_candidate_uids(self, model: str) -> list[str]:
++        """候选账号：冷却过滤 + **区域过滤**。
++
++        区域过滤是必须的：国内版与国际版是两套独立账号体系，token 不能跨区使用。
++        不加这道过滤，failover 会切到另一区的账号，上游直接 401（APISIX HTML 页），
++        表现为"网关好好的突然全挂"。
++        """
+         all_accs = self.get_all_accounts()
+         if not all_accs:
+             return []
+         ready = [uid for uid, _ in all_accs if not _is_account_cooldown(uid, model)]
+-        return ready
++        same_region = [
++            uid for uid, session in all_accs
++            if not _is_account_cooldown(uid, model)
++            and _domain_region(_account_domain(session)) == _BACKEND_REGION
++        ]
++        # 同区账号存在时只用同区的；一个都没有才退回全部（宁可尝试也不要直接死）
++        return same_region or ready
+ 
+     def get_account_expire_at(self, uid: str) -> int:
+         """获取指定账号资产的最早到期时间（Unix 秒），0 表示未知。"""
+@@ -3494,6 +3762,13 @@ class AccountRotator:
+         if not all_accs:
+             return []
+         ready = [uid for uid, _ in all_accs if not _is_account_cooldown(uid, model)]
++        # 区域过滤：与 get_candidate_uids 同一口径，只用与后端同区的账号。
++        same_region = [
++            uid for uid, session in all_accs
++            if not _is_account_cooldown(uid, model)
++            and _domain_region(_account_domain(session)) == _BACKEND_REGION
++        ]
++        ready = same_region or ready
+         if len(ready) <= 1:
+             return ready
+ 
+@@ -3583,10 +3858,19 @@ class AccountRotator:
+             cleaned_acc = req_account.strip()
+             if cleaned_acc:
+                 all_accs = self.get_all_accounts()
++                # 区域门禁：请求头指定的账号也必须与后端同区。
++                # 国内版与国际版是两套独立账号体系，跨区 token 会被上游 401 挡下
++                # （APISIX HTML 页）。指定一个异区账号没有任何意义 —— 只会得到 401。
++                def _same_region(uid: str) -> bool:
++                    session = dict(all_accs).get(uid) or {}
++                    return _domain_region(_account_domain(session)) == _BACKEND_REGION
++
+                 exact_uids = [u for u, _ in all_accs if u == cleaned_acc]
+                 if exact_uids:
+                     cand = exact_uids[0]
+-                    if not _is_account_cooldown(cand, model):
++                    if not _same_region(cand):
++                        _log(f"⚠️ [Header 门禁] X-WorkBuddy-Account 指定账号 {cand[:8]}... 与后端区域不符（异区账号 token 不可跨区使用），放弃指定", level="debug")
++                    elif not _is_account_cooldown(cand, model):
+                         target_uid = cand
+                     else:
+                         _log(f"⚠️ [Header 门禁] X-WorkBuddy-Account 指定账号 {cand[:8]}... 处于冷却中，放弃指定并回退策略", level="debug")
+@@ -3599,7 +3883,9 @@ class AccountRotator:
+                                 matched_alias.append(u)
+                     if len(matched_alias) == 1:
+                         cand = matched_alias[0]
+-                        if not _is_account_cooldown(cand, model):
++                        if not _same_region(cand):
++                            _log(f"⚠️ [Header 门禁] X-WorkBuddy-Account 指定别名账号 {cand[:8]}... 与后端区域不符，放弃指定", level="debug")
++                        elif not _is_account_cooldown(cand, model):
+                             target_uid = cand
+                         else:
+                             _log(f"⚠️ [Header 门禁] X-WorkBuddy-Account 指定别名账号 {cand[:8]}... 处于冷却中，放弃指定并回退策略", level="debug")
+@@ -4193,6 +4479,11 @@ async def chat_completions(request: Request,
+     if CONFIG.get("desensitize"):
+         body = desensitize_body(body, roles=("system", "assistant"))
+ 
++    # 11128 渠道校验救援（一级）：首条 system 兜底 + 身份子句逐词断开。
++    # 与脱敏互补——脱敏管敏感词，这一层管客户端身份指纹，是 11128 的真正主因。
++    if CONFIG.get("channel_guard", True):
++        body = channel_prepare_body(body)
++
+     # 日志：请求摘要
+     model_name = _normalize_model_name(payload.get("model"))
+     mapped_model = MODEL_MAP.get(model_name, model_name)
+@@ -4329,8 +4620,9 @@ async def chat_completions(request: Request,
+ 
+     # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
+     retry_budget = rotator.get_retry_budget(model_name)
+-    max_attempts = retry_budget + 1
++    max_attempts = retry_budget + 1 + _CHANNEL_RESCUE_LEVELS
+     blank_retries = 0
++    channel_rescues = 0
+     fallback_tried = False
+     actual_model = body["model"]
+     fallback_reason = None
+@@ -4339,7 +4631,7 @@ async def chat_completions(request: Request,
+ 
+     for attempt in range(max_attempts):
+         try:
+-            async with (pacer_ctx if pacer_ctx else asyncio.nullcontext()):
++            async with (pacer_ctx if pacer_ctx else _nullcontext()):
+                 async with _shared_client_ctx(timeout=_SHARED_TIMEOUT_DEFAULT) as c:
+                     async with c.stream("POST", url, headers=headers, json=body) as r:
+                         if r.status_code != 200:
+@@ -4352,6 +4644,16 @@ async def chat_completions(request: Request,
+                                 _record_usage(actual_model, False, t0, error="HTTP 400 (11140 content rejected)",
+                                               requested_model=model_name, fallback_reason=fallback_reason)
+                                 return JSONResponse(status_code=400, content=_safe_err_raw(raw, r.status_code))
++                            # 11128 渠道门：拒绝的是这份请求的字节，不是账号。
++                            # 改写 body 重发即可救回，切号无意义（同样字节照样被拒）。
++                            if channel_is_reject(err_str) and channel_rescues < _CHANNEL_RESCUE_LEVELS:
++                                channel_rescues += 1
++                                rescued = _channel_rescue_body(body, channel_rescues)
++                                if rescued is not None:
++                                    body = rescued
++                                    _log(f"[{rid}] ⚠️ 上游 11128 渠道校验拒绝，第 {channel_rescues} 级救援后重发")
++                                    continue
++                                _log(f"[{rid}] ⚠️ 上游 11128 渠道校验拒绝，第 {channel_rescues} 级救援改不动 body")
+                             _record_rate_limit(model_name, err_str, uid=uid, status_code=r.status_code)
+                             if not fallback_tried and _is_unauthorized_model_error(r.status_code, err_str) and body.get("model") in GPT_FALLBACK_MAP:
+                                 fallback_tried = True
+@@ -4513,6 +4815,9 @@ async def anthropic_messages(
+     if CONFIG.get("desensitize"):
+         body = desensitize_body(body, roles=("system", "assistant"))
+ 
++    if CONFIG.get("channel_guard", True):
++        body = channel_prepare_body(body)
++
+     body["model"] = mapped_model
+ 
+     # DeepSeek 思维链开关注入与多轮 reasoning_content 一致性回填（防 11133 与思维链丢失）
+@@ -4637,8 +4942,9 @@ async def anthropic_messages(
+ 
+     # 非流式
+     retry_budget = rotator.get_retry_budget(model_name)
+-    max_attempts = retry_budget + 1
++    max_attempts = retry_budget + 1 + _CHANNEL_RESCUE_LEVELS
+     blank_retries = 0
++    channel_rescues = 0
+     fallback_tried = False
+     actual_model = body["model"]
+     fallback_reason = None
+@@ -4647,7 +4953,7 @@ async def anthropic_messages(
+ 
+     for attempt in range(max_attempts):
+         try:
+-            async with (pacer_ctx if pacer_ctx else asyncio.nullcontext()):
++            async with (pacer_ctx if pacer_ctx else _nullcontext()):
+                 async with _shared_client_ctx(timeout=_SHARED_TIMEOUT_DEFAULT) as c:
+                     async with c.stream("POST", url, headers=headers, json=body) as r:
+                         if r.status_code != 200:
+@@ -4662,6 +4968,16 @@ async def anthropic_messages(
+                                     status_code=400,
+                                     content={"type": "error", "error": {"type": "invalid_request_error", "message": "上游内容安全审核未通过 (11140)，请调整提示词后重试"}},
+                                 )
++                            # 11128 渠道门：拒绝的是这份请求的字节，不是账号。
++                            # 改写 body 重发即可救回，切号无意义（同样字节照样被拒）。
++                            if channel_is_reject(err_str) and channel_rescues < _CHANNEL_RESCUE_LEVELS:
++                                channel_rescues += 1
++                                rescued = _channel_rescue_body(body, channel_rescues)
++                                if rescued is not None:
++                                    body = rescued
++                                    _log(f"[{rid}] ⚠️ 上游 11128 渠道校验拒绝，第 {channel_rescues} 级救援后重发")
++                                    continue
++                                _log(f"[{rid}] ⚠️ 上游 11128 渠道校验拒绝，第 {channel_rescues} 级救援改不动 body")
+                             _record_rate_limit(model_name, err_str, uid=uid, status_code=r.status_code)
+                             if not fallback_tried and _is_unauthorized_model_error(r.status_code, err_str) and body.get("model") in GPT_FALLBACK_MAP:
+                                 fallback_tried = True
+@@ -4820,6 +5136,9 @@ async def openai_responses(
+     if CONFIG.get("desensitize"):
+         body = desensitize_body(body, roles=("system", "assistant"))
+ 
++    if CONFIG.get("channel_guard", True):
++        body = channel_prepare_body(body)
++
+     model_name = _normalize_model_name(raw_body.get("model"))
+     mapped_model = MODEL_MAP.get(model_name, model_name)
+     body["model"] = mapped_model
+@@ -4938,8 +5257,9 @@ async def openai_responses(
+         return resp
+ 
+     retry_budget = rotator.get_retry_budget(model_name) if rotator else 1
+-    max_attempts = retry_budget + 1
++    max_attempts = retry_budget + 1 + _CHANNEL_RESCUE_LEVELS
+     blank_retries = 0
++    channel_rescues = 0
+     fallback_tried = False
+     actual_model = body["model"]
+     fallback_reason = None
+@@ -4948,7 +5268,7 @@ async def openai_responses(
+ 
+     for attempt in range(max_attempts):
+         try:
+-            async with (pacer_ctx if pacer_ctx else asyncio.nullcontext()):
++            async with (pacer_ctx if pacer_ctx else _nullcontext()):
+                 async with _shared_client_ctx(timeout=_SHARED_TIMEOUT_DEFAULT) as c:
+                     async with c.stream("POST", url, headers=headers, json=body) as r:
+                         if r.status_code != 200:
+@@ -4960,6 +5280,16 @@ async def openai_responses(
+                                 _record_usage(actual_model, False, t0, error="HTTP 400 (11140 content rejected)",
+                                               requested_model=model_name, fallback_reason=fallback_reason)
+                                 return JSONResponse(status_code=400, content=_safe_err_raw(raw, r.status_code))
++                            # 11128 渠道门：拒绝的是这份请求的字节，不是账号。
++                            # 改写 body 重发即可救回，切号无意义（同样字节照样被拒）。
++                            if channel_is_reject(err_str) and channel_rescues < _CHANNEL_RESCUE_LEVELS:
++                                channel_rescues += 1
++                                rescued = _channel_rescue_body(body, channel_rescues)
++                                if rescued is not None:
++                                    body = rescued
++                                    _log(f"[{rid}] ⚠️ 上游 11128 渠道校验拒绝，第 {channel_rescues} 级救援后重发")
++                                    continue
++                                _log(f"[{rid}] ⚠️ 上游 11128 渠道校验拒绝，第 {channel_rescues} 级救援改不动 body")
+                             _record_rate_limit(model_name, err_str, uid=uid, status_code=r.status_code)
+                             if not fallback_tried and _is_unauthorized_model_error(r.status_code, err_str) and body.get("model") in GPT_FALLBACK_MAP:
+                                 fallback_tried = True

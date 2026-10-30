@@ -1,0 +1,184 @@
+# ===========================================================================
+# AI Gateways —— Trae / WorkBuddy / 用量面板，一套 compose 全起。
+#
+# 快速开始：
+#   ./scripts/build.sh          # 构建三个镜像
+#   cp .env.example .env        # 填 key 与地址
+#   docker compose up -d
+#
+# 绑定地址默认 127.0.0.1（只有本机能访问），必须在 .env 里显式指定
+# LAN_IP / TAILNET_IP 才会对外发布 —— 避免误把网关暴露到公网。
+# ===========================================================================
+
+services:
+  # -----------------------------------------------------------------------
+  # Trae 网关
+  # -----------------------------------------------------------------------
+  trae2api-hub:
+    image: trae2api-hub:latest
+    container_name: trae2api-hub
+    restart: unless-stopped
+    ports:
+      - "${LAN_IP:-127.0.0.1}:8791:8791"
+      - "${TAILNET_IP:-127.0.0.1}:8791:8791"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8791
+      - API_KEY=${TRAE_API_KEY:?请先在 .env 里设置 TRAE_API_KEY}
+      # SOLO 通道设备标识。上游代码里硬编码的默认值被所有使用者共享，已被
+      # Trae 风控标记 → 一律返回 4017。这里用本机派生值，必须自己生成：
+      #   见 docs/trae.md「4017 风控」一节
+      - TRAE_DEVICE_ID=${TRAE_DEVICE_ID:?请先在 .env 里设置 TRAE_DEVICE_ID}
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./data/trae/accounts:/app/accounts
+      - ./data/trae/usage:/app/usage
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:%s/ping' % os.environ.get('PORT','8791'),timeout=3)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # -----------------------------------------------------------------------
+  # WorkBuddy 网关
+  # -----------------------------------------------------------------------
+  workbuddy2api:
+    image: workbuddy2api:latest
+    container_name: workbuddy2api
+    restart: unless-stopped
+    ports:
+      - "${LAN_IP:-127.0.0.1}:8787:8787"
+      - "${TAILNET_IP:-127.0.0.1}:8787:8787"
+    environment:
+      - WORKBUDDY2API_KEY=${WORKBUDDY2API_KEY:?请先在 .env 里设置 WORKBUDDY2API_KEY}
+      # 请求体上限：默认 16MB 对长上下文 Agent 请求远远不够
+      # （实测一次带 47 个工具 schema 的长会话到 17.9MB 就被 413 拒了）
+      - WORKBUDDY2API_MAX_BODY_MB=64
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./data/workbuddy:/data
+    command: ["--host", "0.0.0.0", "--port", "8787", "--skip-check",
+              "--log", "/data/converter.log", "--log-level", "info",
+              # 必须开：覆盖另一批上游 11128 触发词（见 docs/workbuddy.md）
+              "--desensitize",
+              "--usage-log", "/data/usage.jsonl", "--no-snapshots",
+              "--rotate-mode", "failover"]
+
+  # -----------------------------------------------------------------------
+  # 每日账号巡检（旁挂）：每账号发一条最小请求 + 补签到
+  # 零侵入 converter.py；不需要时删掉本段即可
+  # -----------------------------------------------------------------------
+  workbuddy2api-sweep:
+    image: workbuddy2api:latest
+    container_name: workbuddy2api-sweep
+    restart: unless-stopped
+    depends_on:
+      - workbuddy2api
+    environment:
+      - WORKBUDDY2API_KEY=${WORKBUDDY2API_KEY:?请先在 .env 里设置 WORKBUDDY2API_KEY}
+      - LOCALAPPDATA=/data
+      - TZ=Asia/Shanghai
+      - SWEEP_BASE_URL=http://workbuddy2api:8787
+      - SWEEP_MODEL=${SWEEP_MODEL:-hy4-preview}
+      - SWEEP_MODEL_INTL=${SWEEP_MODEL_INTL:-deepseek-v4.1-flash}
+    volumes:
+      - ./data/workbuddy:/data
+      - ./scripts/daily_sweep.py:/app/daily_sweep.py:ro
+    entrypoint: ["python", "/app/daily_sweep.py"]
+    command: ["--loop", "--time", "00:05"]
+
+  # -----------------------------------------------------------------------
+  # 统一用量面板（只对 tailnet 开放，无鉴权 —— 访问控制交给 tailnet）
+  # -----------------------------------------------------------------------
+  gateway-dashboard:
+    image: gateway-dashboard:latest
+    container_name: gateway-dashboard
+    restart: unless-stopped
+    ports:
+      - "${TAILNET_IP:-127.0.0.1}:8899:8899"
+    environment:
+      - WORKBUDDY2API_KEY=${WORKBUDDY2API_KEY:?请先在 .env 里设置 WORKBUDDY2API_KEY}
+      - TRAE_API_KEY=${TRAE_API_KEY:?请先在 .env 里设置 TRAE_API_KEY}
+      # 同一 compose 网络，走服务名，不依赖宿主机端口发布
+      - WB_BASE=http://workbuddy2api:8787
+      - TRAE_BASE=http://trae2api-hub:8791
+      - TZ=Asia/Shanghai
+    volumes:
+      # 请求来源统计要读两边 usage.jsonl（接口只给按 key 的聚合值）
+      - ./data/workbuddy:/data/wb:ro
+      - ./data/trae:/data/trae:ro
+    depends_on:
+      - trae2api-hub
+      - workbuddy2api
+
+  # -----------------------------------------------------------------------
+  # 端口绑定看门狗（旁挂）
+  #
+  # 宿主机重启后 docker 有两种坏法，都实测遇到过：
+  #   A. 容器没被拉起（Exited）—— 别假设 restart: unless-stopped 一定可靠
+  #   B. 容器在跑但端口绑定丢失（docker port 为空，宿主机访问 000）
+  # 本 sidecar 每 30s 检查一次，发现问题就只重建**那一个**容器。
+  # -----------------------------------------------------------------------
+  gateway-watchdog:
+    image: docker:cli
+    container_name: gateway-watchdog
+    restart: unless-stopped
+    environment:
+      - DOCKER_CONFIG=${PROJECT_DIR:?请先在 .env 里设置 PROJECT_DIR（本项目绝对路径）}
+      - HOST_PROJECT_DIR=${PROJECT_DIR:?请先在 .env 里设置 PROJECT_DIR}
+      - TZ=Asia/Shanghai
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # 挂到 sidecar 内的**同名路径**：compose 里的相对路径要按宿主路径解析，
+      # 挂到别的路径会让 volume 源指向不存在的目录（账号目录会变空）
+      - ${PROJECT_DIR:?}:${PROJECT_DIR:?}:rw
+    command:
+      - sh
+      - -c
+      - |
+        # 注意：Compose 会插值 $ 变量，shell 变量必须写成 $$（转义）。
+        # 漏一个就会变成空串，判断恒为假、该分支静默失效 —— 踩过。
+        while true; do
+          need=""
+          for c in trae2api-hub workbuddy2api gateway-dashboard; do
+            run=$(docker inspect -f "{{.State.Running}}" "$$c" 2>/dev/null || echo missing)
+            if [ "$$run" = "missing" ]; then
+              echo "[watchdog] $$c 不存在，交给 compose 创建"
+              need="$$need $$c"
+              continue
+            fi
+            if [ "$$run" != "true" ]; then
+              echo "[watchdog] $$c 未运行（Exited），需要拉起"
+              need="$$need $$c"
+              continue
+            fi
+            cfg=$(docker inspect -f "{{json .HostConfig.PortBindings}}" "$$c" 2>/dev/null || echo null)
+            act=$(docker inspect -f "{{json .NetworkSettings.Ports}}" "$$c" 2>/dev/null || echo null)
+            if [ "$$cfg" != "null" ] && [ "$$act" = "{}" ]; then
+              echo "[watchdog] $$c 端口绑定丢失，需要重建"
+              need="$$need $$c"
+            fi
+          done
+          if [ -n "$$need" ]; then
+            for target in $$need; do
+              echo "[watchdog] 处理 $$target"
+              docker rm -f "$$target" >/dev/null 2>&1
+              # 逐个容器重建，绝不带 --force-recreate 全项目：
+              # 那会把看门狗自己也销毁，执行到一半被 SIGKILL，
+              # 所有容器卡在 Created 没人拉起 —— 踩过。
+              docker compose -p "$${COMPOSE_PROJECT_NAME:-ai-gateways}" \
+                --project-directory "$${HOST_PROJECT_DIR}" \
+                -f "$${HOST_PROJECT_DIR}/docker-compose.yml" up -d --no-deps "$$target" 2>&1 | tail -3
+            done
+            sleep 8
+            for c in $$need; do
+              run=$(docker inspect -f "{{.State.Running}}" "$$c" 2>/dev/null || echo missing)
+              if [ "$$run" != "true" ]; then
+                echo "[watchdog] 警告：$$c 重建后仍未运行（run=$$run）"
+              fi
+            done
+          fi
+          sleep 30
+        done

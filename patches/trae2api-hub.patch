@@ -1,0 +1,569 @@
+diff --git a/trae_proxy.py b/trae_proxy.py
+index ce28f99..3fc5c43 100644
+--- a/trae_proxy.py
++++ b/trae_proxy.py
+@@ -42,6 +42,7 @@ import ipaddress
+ import socket
+ import ssl
+ import sys
++import contextvars
+ import threading
+ import fnmatch
+ import time
+@@ -672,6 +673,52 @@ def record_quota(account, payload):
+         pass
+ 
+ 
++# ---------------------------------------------------------------------------
++# 请求来源标注（供用量日志归档，面板据此统计「来源 / 各来源消耗」）
++# ---------------------------------------------------------------------------
++#
++# 用 ContextVar 而不是给 record_usage 加必填参数：用量记录发生在多条链路
++# （chat / responses / messages / agent）里，逐个传参容易漏。
++# do_POST 在入口 set，record_usage 读。ThreadingHTTPServer 每个请求在自己的
++# 线程里跑，contextvar 天然隔离；每次 do_POST 重新 set 覆盖旧值，避免
++# keep-alive 复用线程时把上一次的来源带过来。
++_USAGE_SOURCE = contextvars.ContextVar("trae_usage_source", default=None)
++
++
++def _client_label(ua):
++    """User-Agent -> 可读客户端名（面板按此分组）。只做标识，不参与鉴权。"""
++    u = (ua or "").strip()
++    if not u:
++        return "(无 UA)"
++    low = u.lower()
++    for needle, label in (
++        ("deepseek-harness", "DSH"),
++        ("dsh", "DSH"),
++        ("claude-cli", "Claude Code"),
++        ("claude-code", "Claude Code"),
++        ("codex", "Codex CLI"),
++        ("hermes", "Hermes"),
++        ("openai-python", "Python SDK"),
++        ("openai-node", "Node SDK"),
++        ("httpx", "Python httpx"),
++        ("python-requests", "Python requests"),
++        ("aiohttp", "Python aiohttp"),
++        ("node-fetch", "Node fetch"),
++        ("undici", "Node undici"),
++        ("curl", "curl"),
++        ("postman", "Postman"),
++        ("insomnia", "Insomnia"),
++        ("cherry", "Cherry Studio"),
++        ("lobechat", "LobeChat"),
++        ("chatbox", "Chatbox"),
++        ("nextchat", "NextChat"),
++    ):
++        if needle in low:
++            return label
++    head = u.split()[0].split("/")[0]
++    return head[:40] or "(未知)"
++
++
+ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
+                  gen_ms=None, fp=None, account=None, effort=None,
+                  effort_requested=None, key_id=None, realm_reason=None):
+@@ -729,6 +776,18 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
+     if key_id:
+         # 只记 key 的**标识**（panel 分配的 id / legacy / launcher），绝无明文 key。
+         row["key_id"] = str(key_id)
++    # 请求来源：取不到就一个键都不写（面板按「有无该键」区分历史行）
++    try:
++        _src = _USAGE_SOURCE.get(None)
++        if _src:
++            if _src.get("client_ip"):
++                row["client_ip"] = _src["client_ip"]
++            if _src.get("endpoint"):
++                row["endpoint"] = _src["endpoint"]
++            if _src.get("client"):
++                row["client"] = _src["client"]
++    except Exception:
++        pass
+     if realm_reason is not None:
+         # #26：本次是否**自动换区**及原因（持久化，面板不依赖响应头即可读到）。
+         #   "model_missing" 当前区官方清单里没有这个模型（独占表 / 清单驱动）
+@@ -5815,7 +5874,26 @@ def trae_solo_chat(account, payload, timeout=180):
+         "max_tokens": int(payload.get("max_tokens") or 1000000),
+     }
+     if isinstance(payload.get("tools"), list) and payload["tools"]:
+-        body["tools"] = payload["tools"]
++        # SOLO 上游的 FunctionDefinition.parameters 是 string（JSON schema 文本），
++        # 标准 OpenAI 客户端传的是 object —— 这里统一序列化，dict/str 双兼容。
++        norm_tools = []
++        for t in payload["tools"]:
++            if not isinstance(t, dict):
++                continue
++            fn = t.get("function") if isinstance(t.get("function"), dict) else t
++            if not isinstance(fn, dict):
++                continue
++            params = fn.get("parameters")
++            if isinstance(params, (dict, list)):
++                params = json.dumps(params, ensure_ascii=False)
++            elif not isinstance(params, str):
++                params = '{"type":"object","properties":{}}'
++            norm_fn = dict(fn)
++            norm_fn["parameters"] = params
++            norm_tools.append({"type": "function", "function": norm_fn}
++                              if "function" in t else norm_fn)
++        if norm_tools:
++            body["tools"] = norm_tools
+     req = urllib.request.Request(
+         "https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat",
+         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+@@ -5829,6 +5907,9 @@ def trae_solo_chat(account, payload, timeout=180):
+     reasoning_parts = []
+     finish_reason = "stop"
+     usage = {}
++    # 工具调用按 index 聚合：上游把 arguments 切成多帧下发，且后续帧的
++    # id/name 为空（只带增量 arguments），必须按 index 归并才对得上。
++    tool_call_slots = {}
+     try:
+         for raw_line in resp:
+             line = raw_line.decode("utf-8", "replace").strip()
+@@ -5841,12 +5922,34 @@ def trae_solo_chat(account, payload, timeout=180):
+                 event = json.loads(raw)
+             except Exception:
+                 continue
++            if not isinstance(event, dict):
++                continue  # 上游偶尔下发纯字符串帧（keep-alive/说明文本），跳过
+             if event.get("code") not in (None, 0):
+                 raise RuntimeError("solo error %s: %s" % (event.get("code"), event.get("message") or event.get("msg") or ""))
+             if event.get("response"):
+                 text_parts.append(str(event["response"]))
+             if event.get("reasoning_content"):
+                 reasoning_parts.append(str(event["reasoning_content"]))
++            for tc in (event.get("tool_calls") or []):
++                if not isinstance(tc, dict):
++                    continue
++                idx = tc.get("index")
++                idx = int(idx) if isinstance(idx, (int, float)) else 0
++                slot = tool_call_slots.setdefault(idx, {"id": "", "name": "", "arguments": ""})
++                if tc.get("id"):
++                    slot["id"] = str(tc["id"])
++                fc = tc.get("function_call")
++                if isinstance(fc, dict):
++                    if fc.get("name"):
++                        slot["name"] = str(fc["name"])
++                    if fc.get("arguments"):
++                        slot["arguments"] += str(fc["arguments"])
++                elif tc.get("function") and isinstance(tc["function"], dict):
++                    fn = tc["function"]
++                    if fn.get("name"):
++                        slot["name"] = str(fn["name"])
++                    if fn.get("arguments"):
++                        slot["arguments"] += str(fn["arguments"])
+             if event.get("finish_reason"):
+                 finish_reason = str(event["finish_reason"])
+             if "prompt_tokens" in event:
+@@ -5859,11 +5962,191 @@ def trae_solo_chat(account, payload, timeout=180):
+         except Exception:
+             pass
+     content = "".join(text_parts)
+-    if not content:
++    # 组装工具调用（按 index 顺序），仅保留拿到了名字的
++    tool_calls = []
++    for idx in sorted(tool_call_slots):
++        slot = tool_call_slots[idx]
++        name = (slot.get("name") or "").strip()
++        if not name:
++            continue
++        args = slot.get("arguments") or "{}"
++        try:
++            json.loads(args)
++        except Exception:
++            args = "{}"   # 分片残留导致非法 JSON 时给空对象，别让整条请求崩
++        tool_calls.append({
++            "id": slot.get("id") or ("call_" + uuid.uuid4().hex),
++            "type": "function",
++            "function": {"name": name, "arguments": args},
++        })
++    # 纯工具调用没有正文是合法的；两者都空才是真失败
++    if not content and not tool_calls:
+         raise RuntimeError("solo returned empty content")
+     return {"content": content, "reasoning": "".join(reasoning_parts),
+             "finish_reason": finish_reason, "usage": usage,
+-            "model": model}
++            "tool_calls": tool_calls, "model": model}
++
++def trae_solo_chat_stream(account, payload, timeout=180):
++    """流式版 SOLO 对话：**边读上游边产出**，逐帧交给调用方。
++
++    与 `trae_solo_chat` 的区别（这是"假流式"的根因修复）：后者把整个 SSE 读完
++    才 return，调用方只能一次性把全文塞进一个 chunk —— 客户端看到的是"卡很久
++    然后整段蹦出来"。本函数每收到一个 output 帧就 yield 一次，配合调用方的
++    `_sse_write` 才是真流式。
++
++    yield 的 dict 形状：
++      {"type": "text",      "text": str}         正文增量
++      {"type": "reasoning", "text": str}         思考增量
++      {"type": "tool_call", "index": int, "id": str,
++                            "name": str, "arguments": str}   工具调用增量
++      {"type": "done", "finish_reason": str, "usage": dict}    收尾（一定最后一条）
++
++    usage 取自上游的 `token_usage` 事件帧（包含 prompt/completion/total 以及
++    reasoning_tokens、缓存命中字段），这是 DSH 能算 token 的关键数据源。
++    """
++    token = str(getattr(account, "token", "") or "").strip()
++    if not token:
++        raise RuntimeError("account access token is empty")
++    uid = str(getattr(account, "uid", "") or "").strip()
++    extra = getattr(account, "extra", None) or {}
++    dev = str(extra.get("device_id") or os.environ.get("TRAE_DEVICE_ID") or "1149420231460112").strip()
++    mid = str(extra.get("machine_id") or os.environ.get("TRAE_MACHINE_ID") or "d979d81c1deda7a803cb6b76be69cff63b40dd24ea60d3fabbd865607f7ee695").strip()
++    headers = {
++        "Accept": "text/event-stream",
++        "Content-Type": "application/json",
++        "User-Agent": "Trae/0.1.61 antigravity-cockpit-tools",
++        "Authorization": "Cloud-IDE-JWT " + token,
++        "X-Cloudide-Token": token,
++        "X-Ide-Token": token,
++        "X-Uid": uid,
++        "X-Machine-Id": mid,
++        "X-Device-Id": dev,
++        "X-App-Id": "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8",
++        "X-App-Version": "default",
++        "X-Ide-Version": "0.1.61",
++        "X-Ide-Version-Code": "20260820",
++        "X-App-Version-Code": "20260820",
++        "X-Ide-Version-Type": "stable",
++        "X-Device-Type": "windows",
++        "X-OS-Version": "Windows 11 Pro",
++        "X-Device-Brand": "83DG",
++        "Request-Traffic-Type": "prod",
++    }
++    model = str(payload.get("model") or "deepseek-v4.1-flash").strip()
++    model = SOLO_MODEL_ALIASES.get(model, model)
++    if model.endswith("-solo"):
++        model = model[:-5]
++    messages = []
++    for m in payload.get("messages") or []:
++        if not isinstance(m, dict):
++            continue
++        role = str(m.get("role") or "user")
++        if role == "developer":
++            role = "system"
++        content = m.get("content")
++        if isinstance(content, str):
++            blocks = [{"type": "text", "text": content}]
++        elif isinstance(content, list):
++            blocks = []
++            for part in content:
++                if isinstance(part, dict) and part.get("type") == "text":
++                    blocks.append({"type": "text", "text": str(part.get("text") or "")})
++            if not blocks:
++                continue
++        else:
++            continue
++        messages.append({"role": role, "content": blocks})
++    if not messages:
++        raise RuntimeError("messages must not be empty")
++    body = {
++        "messages": messages,
++        "function": "solo_work_lite",
++        "stream": True,
++        "config_name": model,
++        "model": model,
++        "max_tokens": int(payload.get("max_tokens") or 1000000),
++    }
++    if isinstance(payload.get("tools"), list) and payload["tools"]:
++        norm_tools = []
++        for t in payload["tools"]:
++            if not isinstance(t, dict):
++                continue
++            fn = t.get("function") if isinstance(t.get("function"), dict) else t
++            if not isinstance(fn, dict):
++                continue
++            params = fn.get("parameters")
++            if isinstance(params, (dict, list)):
++                params = json.dumps(params, ensure_ascii=False)
++            elif not isinstance(params, str):
++                params = '{"type":"object","properties":{}}'
++            norm_fn = dict(fn)
++            norm_fn["parameters"] = params
++            norm_tools.append({"type": "function", "function": norm_fn}
++                              if "function" in t else norm_fn)
++        if norm_tools:
++            body["tools"] = norm_tools
++    req = urllib.request.Request(
++        "https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat",
++        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
++        headers=headers, method="POST")
++    try:
++        resp = urllib.request.urlopen(req, timeout=timeout)
++    except urllib.error.HTTPError as exc:
++        detail = exc.read(2000).decode("utf-8", "replace")
++        raise RuntimeError("solo HTTP %s: %s" % (exc.code, detail[:800]))
++
++    finish_reason = "stop"
++    usage = {}
++    try:
++        for raw_line in resp:
++            line = raw_line.decode("utf-8", "replace").strip()
++            if not line.startswith("data:"):
++                continue
++            raw = line[5:].strip()
++            if not raw or raw == "[DONE]":
++                continue
++            try:
++                event = json.loads(raw)
++            except Exception:
++                continue
++            if not isinstance(event, dict):
++                continue
++            if event.get("code") not in (None, 0):
++                raise RuntimeError("solo error %s: %s"
++                                   % (event.get("code"),
++                                      event.get("message") or event.get("msg") or ""))
++            # 正文增量：上游每帧一个词/字，逐帧下发即真流式
++            if event.get("reasoning_content"):
++                yield {"type": "reasoning", "text": str(event["reasoning_content"])}
++            if event.get("response"):
++                yield {"type": "text", "text": str(event["response"])}
++            for tc in (event.get("tool_calls") or []):
++                if not isinstance(tc, dict):
++                    continue
++                idx = tc.get("index")
++                idx = int(idx) if isinstance(idx, (int, float)) else 0
++                fc = tc.get("function_call")
++                if not isinstance(fc, dict):
++                    fc = tc.get("function") if isinstance(tc.get("function"), dict) else {}
++                yield {"type": "tool_call", "index": idx,
++                       "id": str(tc.get("id") or ""),
++                       "name": str(fc.get("name") or ""),
++                       "arguments": str(fc.get("arguments") or "")}
++            if event.get("finish_reason"):
++                finish_reason = str(event["finish_reason"])
++            # token_usage 帧：DSH 算 token 的唯一来源，必须原样透传所有字段
++            if "prompt_tokens" in event:
++                usage = {k: event.get(k) for k in USAGE_FIELDS if k in event}
++                usage["prompt_tokens"] = int(event.get("prompt_tokens") or 0)
++                usage["completion_tokens"] = int(event.get("completion_tokens") or 0)
++                usage["total_tokens"] = int(event.get("total_tokens") or 0)
++    finally:
++        try:
++            resp.close()
++        except Exception:
++            pass
++    yield {"type": "done", "finish_reason": finish_reason, "usage": usage}
++
+ 
+ def trae_open_chat(account, realm, body, host=None, timeout=600):
+     """打开一次 llm_raw_chat（始终流式返回 SSE，协议 §六）。"""
+@@ -9153,6 +9436,19 @@ class Handler(BaseHTTPRequestHandler):
+         self.send_header("Content-Length", "0")
+         self.end_headers()
+ 
++    def _source_client_ip(self):
++        """客户端 IP：优先反向代理转发头，否则用连接对端地址。"""
++        try:
++            fwd = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
++            if fwd:
++                return fwd
++            real = (self.headers.get("X-Real-IP") or "").strip()
++            if real:
++                return real
++            return str(self.client_address[0]) if self.client_address else ""
++        except Exception:
++            return ""
++
+     def do_GET(self):
+         # #26：每个请求入口清空「本次实际出口」标注。self 在 keep-alive 连接上是
+         # **复用**的，不清空的话后续非 chat 端点（/v1/models、/usage/*、/realm）
+@@ -9868,37 +10164,167 @@ class Handler(BaseHTTPRequestHandler):
+         return self._error(404, "not found", "invalid_request_error")
+ 
+     def _handle_agent_solo(self, payload):
++        """SOLO 通道模型（GLM / Kimi / MiMo / MiniMax / Qwen / Seed / Step 等）。
++
++        走 `trae_solo_chat_stream` 真流式：上游每帧一个词，逐帧转发给客户端。
++        同时把上游 `token_usage` 帧落进 usage 记账 —— 这是 DSH 能算 token 的
++        数据源；早先本函数完全没有 record_usage 调用，所以面板/客户端都看到 0。
++        """
+         model = str(payload.get("model") or "deepseek-v4.1-flash")
+         account = POOL.pick(realm="cn")
+         if not account:
+             account = next((a for a in getattr(POOL, "accounts", []) if getattr(a, "realm", "") == "cn"), None)
+         if not account:
+             return self._error(503, "no CN account available", "server_error")
++        fp = prompt_fingerprint(payload.get("messages"))
++        t_start = time.time()
++        want_stream = bool(payload.get("stream"))
++        cid = "chatcmpl-" + uuid.uuid4().hex
++        created = int(time.time())
++        # 工具调用分片聚合（跨帧）：index -> {id, name, arguments}
++        slots = {}
++        text_parts = []
++        reasoning_parts = []
++        usage = {}
++        final_reason = "stop"
++        first_ms = None
++
++        def _aggregate_tool(ev):
++            idx = ev.get("index") or 0
++            slot = slots.setdefault(idx, {"id": "", "name": "", "arguments": ""})
++            if ev.get("id"):
++                slot["id"] = ev["id"]
++            if ev.get("name"):
++                slot["name"] = ev["name"]
++            if ev.get("arguments"):
++                slot["arguments"] += ev["arguments"]
++
++        def _build_tool_calls():
++            out = []
++            for idx in sorted(slots):
++                slot = slots[idx]
++                name = (slot.get("name") or "").strip()
++                if not name:
++                    continue
++                args = slot.get("arguments") or "{}"
++                try:
++                    json.loads(args)
++                except Exception:
++                    args = "{}"
++                out.append({"id": slot.get("id") or ("call_" + uuid.uuid4().hex),
++                            "type": "function",
++                            "function": {"name": name, "arguments": args}})
++            return out
++
+         try:
+-            result = trae_solo_chat(account, {**payload, "model": model})
++            stream = trae_solo_chat_stream(account, {**payload, "model": model})
++            if want_stream:
++                self._sse_begin()
++            for ev in stream:
++                kind = ev.get("type")
++                if kind == "text":
++                    text_parts.append(ev.get("text") or "")
++                    if want_stream:
++                        if first_ms is None:
++                            first_ms = int((time.time() - t_start) * 1000)
++                        self._write_solo_delta(cid, created, model,
++                                               {"content": ev.get("text") or ""})
++                elif kind == "reasoning":
++                    reasoning_parts.append(ev.get("text") or "")
++                    if want_stream:
++                        if first_ms is None:
++                            first_ms = int((time.time() - t_start) * 1000)
++                        # reasoning_content 是 OpenAI 的事实扩展字段，
++                        # 客户端据此渲染思考过程（DSH / Hermes / Cherry 都认）
++                        self._write_solo_delta(cid, created, model,
++                                               {"reasoning_content": ev.get("text") or ""})
++                elif kind == "tool_call":
++                    _aggregate_tool(ev)
++                elif kind == "done":
++                    final_reason = ev.get("finish_reason") or "stop"
++                    usage = ev.get("usage") or {}
+         except Exception as exc:
++            self._record_solo_usage(model, None, t_start, first_ms, fp, account, error=str(exc))
++            if want_stream:
++                # 已经开始写流：只能给协议级 error 事件收尾，不能改状态码
++                try:
++                    self._sse_write(("data: " + json.dumps(
++                        {"error": {"message": "Trae SOLO upstream failed: %s" % exc,
++                                   "type": "upstream_error"}}, ensure_ascii=False) + "\n\n").encode("utf-8"))
++                    self._sse_write(b"data: [DONE]\n\n")
++                    self._sse_end()
++                except Exception:
++                    pass
++                return
+             return self._error(502, "Trae SOLO upstream failed: %s" % exc, "upstream_error")
+-        if payload.get("stream"):
+-            self._sse_begin()
+-            cid = "chatcmpl-" + uuid.uuid4().hex
+-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
+-                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": result["content"]}, "finish_reason": None}]}
+-            self._sse_write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
+-            done = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
+-                    "choices": [{"index": 0, "delta": {}, "finish_reason": result["finish_reason"]}]}
++
++        tool_calls = _build_tool_calls()
++        if tool_calls and final_reason == "stop":
++            final_reason = "tool_calls"
++
++        # 用量记账：无 usage 帧时也落一行（tokens=0 但至少记录这次请求）
++        self._record_solo_usage(model, usage, t_start, first_ms, fp, account,
++                                tool_calls=bool(tool_calls))
++
++        if want_stream:
++            if tool_calls:
++                self._write_solo_delta(cid, created, model, {"tool_calls": [
++                    {"index": i, "id": tc["id"], "type": "function",
++                     "function": tc["function"]} for i, tc in enumerate(tool_calls)]})
++            # usage 无条件带上（OpenAI 规范允许末帧携带；缺失会让客户端显示 0 token）
++            done = {"id": cid, "object": "chat.completion.chunk", "created": created,
++                    "model": model,
++                    "choices": [{"index": 0, "delta": {}, "finish_reason": final_reason}],
++                    "usage": trae_usage_to_openai(usage) if usage else
++                             {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+             self._sse_write(("data: " + json.dumps(done, ensure_ascii=False) + "\n\n").encode("utf-8"))
+             self._sse_write(b"data: [DONE]\n\n")
+             self._sse_end()
+             return
++
++        content = "".join(text_parts)
++        if not content and not tool_calls:
++            return self._error(502, "Trae SOLO upstream returned empty content", "upstream_error")
+         return self._json(200, {
+-            "id": "chatcmpl-" + uuid.uuid4().hex,
++            "id": cid,
+             "object": "chat.completion",
+-            "created": int(time.time()),
++            "created": created,
+             "model": model,
+-            "choices": [{"index": 0, "message": {"role": "assistant", "content": result["content"], "reasoning_content": result["reasoning"]}, "finish_reason": result["finish_reason"]}],
+-            "usage": result["usage"] or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
++            "choices": [{"index": 0, "message": dict(
++                {"role": "assistant", "content": content or None,
++                 "reasoning_content": "".join(reasoning_parts) or None},
++                **({"tool_calls": tool_calls} if tool_calls else {})
++            ), "finish_reason": final_reason}],
++            "usage": trae_usage_to_openai(usage) if usage
++                     else {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+         })
+ 
++    def _write_solo_delta(self, cid, created, model, delta):
++        """写一个 chat.completion.chunk 增量帧。"""
++        chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
++                 "model": model,
++                 "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
++        try:
++            self._sse_write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
++        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
++            raise   # 客户端断开：让上层收尾（不能吞，否则会继续空转烧上游）
++
++    def _record_solo_usage(self, model, usage, t_start, first_ms, fp, account,
++                           tool_calls=False, error=None):
++        """SOLO 通道的用量记账。早先完全没有这一步，导致面板与客户端都显示 0。"""
++        wall = int((time.time() - t_start) * 1000)
++        try:
++            if error:
++                record_error(model, 502, str(error)[:200], elapsed_ms=wall)
++                return
++            record_usage(model, usage or {}, stream=True, elapsed_ms=wall,
++                         ttft_ms=first_ms,
++                         gen_ms=(wall - first_ms) if first_ms is not None else None,
++                         fp=fp, account=getattr(account, "uid", None),
++                         key_id=self._key_id_for_usage())
++        except Exception as exc:
++            log("solo usage record failed: %s" % str(exc)[:120], level="WARN", tag="chat")
++
+     def _handle_agent_ui(self, payload):
+         """Run a client_catalog Agent model through the local Trae CN UI bridge.
+         Requires Trae CN running with --remote-debugging-port=9335 on this host.
+@@ -10724,6 +11150,16 @@ class Handler(BaseHTTPRequestHandler):
+         self.realm_reason = ""
+         self.degraded_from = ""
+         path = self.path.split("?")[0]
++        # 标注请求来源（用量日志归档用）。每次请求重新 set，覆盖 keep-alive
++        # 复用线程时可能残留的旧值；异常一律吞掉，绝不影响请求。
++        try:
++            _USAGE_SOURCE.set({
++                "client_ip": self._source_client_ip(),
++                "endpoint": path,
++                "client": _client_label(self.headers.get("User-Agent") or ""),
++            })
++        except Exception:
++            pass
+         if path == "/update/apply":
+             if not self._panel_ok():
+                 return self._error(401, "panel password required",
