@@ -67,6 +67,41 @@ services:
               "--rotate-mode", "failover"]
 
   # -----------------------------------------------------------------------
+  # WorkBuddy 国际版网关（第二实例，可选）
+  #
+  # 国内版与国际版是两套完全独立的账号体系，一个进程只能服务一边（选号门禁
+  # 按后端区域过滤）。想同时用两边的额度，就起这个第二实例：后端指向
+  # www.workbuddy.ai、挂只含国际账号的 accounts.json、用另一个端口。
+  #
+  # 与国内实例的差别只有「后端地址 / 数据目录 / 端口」三处，其余参数完全一致。
+  # 11128 那套门禁在国际站同样适用（国际站还多一道「首条消息必须是 system」，
+  # channel_guard.ensure_system_head 已经兜住）。
+  #
+  # 不需要国际版时，删掉本段即可，不影响其余服务。
+  # -----------------------------------------------------------------------
+  workbuddy2api-intl:
+    image: workbuddy2api:latest
+    container_name: workbuddy2api-intl
+    restart: unless-stopped
+    ports:
+      - "${LAN_IP:-127.0.0.1}:8788:8788"
+      - "${TAILNET_IP:-127.0.0.1}:8788:8788"
+    environment:
+      - WORKBUDDY2API_KEY=${WORKBUDDY2API_KEY:?请先在 .env 里设置 WORKBUDDY2API_KEY}
+      - WORKBUDDY2API_MAX_BODY_MB=64
+      # ← 唯一的实质差异：后端指向国际站
+      - WORKBUDDY2API_BACKEND=https://www.workbuddy.ai
+      - TZ=Asia/Shanghai
+    volumes:
+      # 独立数据目录：只放国际版账号，与国内实例的账号池完全隔离
+      - ./data/workbuddy-intl:/data
+    command: ["--host", "0.0.0.0", "--port", "8788", "--skip-check",
+              "--log", "/data/converter.log", "--log-level", "info",
+              "--desensitize",
+              "--usage-log", "/data/usage.jsonl", "--no-snapshots",
+              "--rotate-mode", "failover"]
+
+  # -----------------------------------------------------------------------
   # 每日账号巡检（旁挂）：每账号发一条最小请求 + 补签到
   # 零侵入 converter.py；不需要时删掉本段即可
   # -----------------------------------------------------------------------
@@ -103,11 +138,13 @@ services:
       - TRAE_API_KEY=${TRAE_API_KEY:?请先在 .env 里设置 TRAE_API_KEY}
       # 同一 compose 网络，走服务名，不依赖宿主机端口发布
       - WB_BASE=http://workbuddy2api:8787
+      - WB_INTL_BASE=http://workbuddy2api-intl:8788
       - TRAE_BASE=http://trae2api-hub:8791
       - TZ=Asia/Shanghai
     volumes:
       # 请求来源统计要读两边 usage.jsonl（接口只给按 key 的聚合值）
       - ./data/workbuddy:/data/wb:ro
+      - ./data/workbuddy-intl:/data/wb-intl:ro
       - ./data/trae:/data/trae:ro
     depends_on:
       - trae2api-hub
@@ -142,7 +179,7 @@ services:
         # 漏一个就会变成空串，判断恒为假、该分支静默失效 —— 踩过。
         while true; do
           need=""
-          for c in trae2api-hub workbuddy2api gateway-dashboard; do
+          for c in trae2api-hub workbuddy2api workbuddy2api-intl gateway-dashboard; do
             run=$(docker inspect -f "{{.State.Running}}" "$$c" 2>/dev/null || echo missing)
             if [ "$$run" = "missing" ]; then
               echo "[watchdog] $$c 不存在，交给 compose 创建"

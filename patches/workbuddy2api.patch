@@ -1,5 +1,5 @@
 diff --git a/converter.py b/converter.py
-index 80152cb..edc98ad 100644
+index 80152cb..3878430 100644
 --- a/converter.py
 +++ b/converter.py
 @@ -37,7 +37,7 @@ import threading
@@ -55,10 +55,29 @@ index 80152cb..edc98ad 100644
  try:
      from anthropic_compat import (
          translate_anthropic_request,
-@@ -114,6 +151,33 @@ except ImportError:
- BACKEND = "https://copilot.tencent.com"
- DEFAULT_DOMAIN = "www.codebuddy.cn"
+@@ -111,8 +148,49 @@ except ImportError:
+ # 常量
+ # ---------------------------------------------------------------------------
  
+-BACKEND = "https://copilot.tencent.com"
+-DEFAULT_DOMAIN = "www.codebuddy.cn"
++BACKEND_DEFAULT = "https://copilot.tencent.com"
++
++# 后端地址可用环境变量覆盖：`WORKBUDDY2API_BACKEND=https://www.workbuddy.ai`
++#
++# 为什么需要：国内版与国际版是两套完全独立的账号体系，一个进程只能服务一边
++# （选号门禁按后端区域过滤）。想同时用两边的额度，就起两个容器、各指一边，
++# 各自挂只含本区账号的 accounts.json —— 这样两套额度都能用上，且互不干扰。
++BACKEND = (os.environ.get("WORKBUDDY2API_BACKEND") or "").strip().rstrip("/") \
++    or BACKEND_DEFAULT
++# 缺 domain 字段的历史账号按「与后端同区」处理：国内实例归 codebuddy.cn，
++# 国际实例归 workbuddy.ai。否则国际实例会把它们误判成异区而全部排除。
++DEFAULT_DOMAIN = (
++    "www.workbuddy.ai"
++    if ("workbuddy.ai" in BACKEND or "codebuddy.ai" in BACKEND)
++    else "www.codebuddy.cn"
++)
++
 +# 国际版（workbuddy.ai）与国内版（codebuddy.cn）是**两套独立账号体系**：
 +# 各自的 token、计费、模型清单都互不相通。把国际版 token 发到国内版后端
 +# （copilot.tencent.com）会被上游 APISIX 挡下，返回
@@ -85,11 +104,10 @@ index 80152cb..edc98ad 100644
 +
 +# 网关当前后端所属区域。选号时只允许同区域的账号。
 +_BACKEND_REGION = _domain_region(urlsplit(BACKEND).netloc)
-+
+ 
  # ---------------------------------------------------------------------------
  # 平台相关：定位 auth 目录与 WSL 宿主穿透
- # ---------------------------------------------------------------------------
-@@ -749,14 +813,53 @@ class CredentialManager:
+@@ -749,14 +827,53 @@ class CredentialManager:
  
      def _build_headers_from(self, auth: dict, account: dict) -> dict:
          domain = auth.get("domain") or DEFAULT_DOMAIN
@@ -148,7 +166,7 @@ index 80152cb..edc98ad 100644
              "User-Agent": _get_user_agent(domain),
          }
          # 设备风控头：桌面端所有敏感请求均携带（Turing Shield SDK 生成）。
-@@ -818,6 +921,20 @@ class CredentialManager:
+@@ -818,6 +935,20 @@ class CredentialManager:
          return self._build_headers_from(auth, account)
  
      def switch_active_account(self, uid: str) -> bool:
@@ -169,7 +187,7 @@ index 80152cb..edc98ad 100644
          with self._lock:
              ok = _set_active_account(uid)
              if ok:
-@@ -1964,6 +2081,101 @@ class OriginGuardMiddleware:
+@@ -1964,6 +2095,101 @@ class OriginGuardMiddleware:
  
  _BODY_LIMIT_PATHS = frozenset({"/v1/chat/completions", "/v1/messages", "/v1/responses"})
  
@@ -271,7 +289,7 @@ index 80152cb..edc98ad 100644
  
  async def _send_413(send, path: str, size: int) -> None:
      """向客户端下发标准 413 响应（OpenAI / Anthropic 两套错误体）。"""
-@@ -2056,6 +2268,7 @@ class RequestBodyLimitMiddleware:
+@@ -2056,6 +2282,7 @@ class RequestBodyLimitMiddleware:
          return await self.app(scope, replay_receive, send)
  
  
@@ -279,7 +297,7 @@ index 80152cb..edc98ad 100644
  app.add_middleware(LocalHostOnlyMiddleware)
  app.add_middleware(RequestBodyLimitMiddleware)
  # 最后注册 = 最外层（Starlette 后注册者先执行）：跨站请求在读取 body 之前就被拒绝
-@@ -2262,6 +2475,19 @@ def _record_usage(model: str, ok: bool, t0: float, *,
+@@ -2262,6 +2489,19 @@ def _record_usage(model: str, ok: bool, t0: float, *,
              "retry_count": int(retry_count or 0),
              "retry_reason": (_truncate(str(retry_reason), 100) if retry_reason else None),
          }
@@ -299,7 +317,7 @@ index 80152cb..edc98ad 100644
          if requested_model and requested_model != model:
              rec["requested_model"] = requested_model
              rec["actual_model"] = model
-@@ -2961,6 +3187,15 @@ _CREDIT_EXHAUSTED_CODES = {"14018"}
+@@ -2961,6 +3201,15 @@ _CREDIT_EXHAUSTED_CODES = {"14018"}
  #    账号完成开通后应能恢复，绝不能按「额度耗尽」停到次日。
  _ACCOUNT_FAULT_CODES = {"14017"}
  
@@ -315,7 +333,7 @@ index 80152cb..edc98ad 100644
  # ③ 每日额度码（TPD/RPD）：恢复边界是**日**而非小时，冷却须对齐上游 reset 墙钟，
  #    无 reset 时才退化为保守按日；不得与瞬时频控共用 2h 封顶。
  _DAILY_QUOTA_CODES = {"6004", "6008"}
-@@ -3080,16 +3315,21 @@ def _is_credit_exhausted_signal(status_code: int | None, err_text: str) -> bool:
+@@ -3080,16 +3329,21 @@ def _is_credit_exhausted_signal(status_code: int | None, err_text: str) -> bool:
  
  
  def _is_account_fault_signal(status_code: int | None, err_text: str) -> bool:
@@ -338,7 +356,7 @@ index 80152cb..edc98ad 100644
      try:
          data = json.loads(text)
      except Exception:
-@@ -3102,6 +3342,22 @@ def _is_account_fault_signal(status_code: int | None, err_text: str) -> bool:
+@@ -3102,6 +3356,22 @@ def _is_account_fault_signal(status_code: int | None, err_text: str) -> bool:
      return _find_code_anywhere(data, _ACCOUNT_FAULT_CODES)
  
  
@@ -361,7 +379,7 @@ index 80152cb..edc98ad 100644
  def _next_day_reset_ms(hour: int = 0) -> tuple[int, str]:
      """下一个「本地日边界」（UTC+8 的 hour:00）。兜底墙钟必须落在未来，否则顺延一天。
  
-@@ -3460,11 +3716,28 @@ class AccountRotator:
+@@ -3460,11 +3730,28 @@ class AccountRotator:
          return []
  
      def get_candidate_uids(self, model: str) -> list[str]:
@@ -392,7 +410,7 @@ index 80152cb..edc98ad 100644
  
      def get_account_expire_at(self, uid: str) -> int:
          """获取指定账号资产的最早到期时间（Unix 秒），0 表示未知。"""
-@@ -3493,7 +3766,13 @@ class AccountRotator:
+@@ -3493,7 +3780,13 @@ class AccountRotator:
          all_accs = self.get_all_accounts()
          if not all_accs:
              return []
@@ -407,7 +425,7 @@ index 80152cb..edc98ad 100644
          if len(ready) <= 1:
              return ready
  
-@@ -3583,10 +3862,19 @@ class AccountRotator:
+@@ -3583,10 +3876,19 @@ class AccountRotator:
              cleaned_acc = req_account.strip()
              if cleaned_acc:
                  all_accs = self.get_all_accounts()
@@ -428,7 +446,7 @@ index 80152cb..edc98ad 100644
                          target_uid = cand
                      else:
                          _log(f"⚠️ [Header 门禁] X-WorkBuddy-Account 指定账号 {cand[:8]}... 处于冷却中，放弃指定并回退策略", level="debug")
-@@ -3599,7 +3887,9 @@ class AccountRotator:
+@@ -3599,7 +3901,9 @@ class AccountRotator:
                                  matched_alias.append(u)
                      if len(matched_alias) == 1:
                          cand = matched_alias[0]
@@ -439,7 +457,7 @@ index 80152cb..edc98ad 100644
                              target_uid = cand
                          else:
                              _log(f"⚠️ [Header 门禁] X-WorkBuddy-Account 指定别名账号 {cand[:8]}... 处于冷却中，放弃指定并回退策略", level="debug")
-@@ -3651,8 +3941,17 @@ class AccountRotator:
+@@ -3651,8 +3955,17 @@ class AccountRotator:
  
              candidates = self.get_candidate_uids_tiered(model)
              if not candidates:
@@ -459,7 +477,7 @@ index 80152cb..edc98ad 100644
                  if cooldown_uids:
                      best_uid = min(cooldown_uids, key=lambda u: _get_cooldown_reset_ms(u, model))
                      # 单飞探针保护（契约修正 D）：
-@@ -3666,6 +3965,12 @@ class AccountRotator:
+@@ -3666,6 +3979,12 @@ class AccountRotator:
                  if _is_account_cooldown(active_uid, model):
                      _log(f"🛑 [全池冷却防穿透] 模型 {model} 所有账号均在冷却且探针在途，拒绝穿透", level="debug")
                      return "", {}
@@ -472,7 +490,7 @@ index 80152cb..edc98ad 100644
                  return active_uid, self.cred_mgr.get_headers()
  
              if effective_mode == "roundrobin":
-@@ -4193,6 +4498,11 @@ async def chat_completions(request: Request,
+@@ -4193,6 +4512,11 @@ async def chat_completions(request: Request,
      if CONFIG.get("desensitize"):
          body = desensitize_body(body, roles=("system", "assistant"))
  
@@ -484,7 +502,7 @@ index 80152cb..edc98ad 100644
      # 日志：请求摘要
      model_name = _normalize_model_name(payload.get("model"))
      mapped_model = MODEL_MAP.get(model_name, model_name)
-@@ -4329,8 +4639,9 @@ async def chat_completions(request: Request,
+@@ -4329,8 +4653,9 @@ async def chat_completions(request: Request,
  
      # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
      retry_budget = rotator.get_retry_budget(model_name)
@@ -495,7 +513,7 @@ index 80152cb..edc98ad 100644
      fallback_tried = False
      actual_model = body["model"]
      fallback_reason = None
-@@ -4339,7 +4650,7 @@ async def chat_completions(request: Request,
+@@ -4339,7 +4664,7 @@ async def chat_completions(request: Request,
  
      for attempt in range(max_attempts):
          try:
@@ -504,7 +522,7 @@ index 80152cb..edc98ad 100644
                  async with _shared_client_ctx(timeout=_SHARED_TIMEOUT_DEFAULT) as c:
                      async with c.stream("POST", url, headers=headers, json=body) as r:
                          if r.status_code != 200:
-@@ -4352,6 +4663,16 @@ async def chat_completions(request: Request,
+@@ -4352,6 +4677,16 @@ async def chat_completions(request: Request,
                                  _record_usage(actual_model, False, t0, error="HTTP 400 (11140 content rejected)",
                                                requested_model=model_name, fallback_reason=fallback_reason)
                                  return JSONResponse(status_code=400, content=_safe_err_raw(raw, r.status_code))
@@ -521,7 +539,7 @@ index 80152cb..edc98ad 100644
                              _record_rate_limit(model_name, err_str, uid=uid, status_code=r.status_code)
                              if not fallback_tried and _is_unauthorized_model_error(r.status_code, err_str) and body.get("model") in GPT_FALLBACK_MAP:
                                  fallback_tried = True
-@@ -4513,6 +4834,9 @@ async def anthropic_messages(
+@@ -4513,6 +4848,9 @@ async def anthropic_messages(
      if CONFIG.get("desensitize"):
          body = desensitize_body(body, roles=("system", "assistant"))
  
@@ -531,7 +549,7 @@ index 80152cb..edc98ad 100644
      body["model"] = mapped_model
  
      # DeepSeek 思维链开关注入与多轮 reasoning_content 一致性回填（防 11133 与思维链丢失）
-@@ -4637,8 +4961,9 @@ async def anthropic_messages(
+@@ -4637,8 +4975,9 @@ async def anthropic_messages(
  
      # 非流式
      retry_budget = rotator.get_retry_budget(model_name)
@@ -542,7 +560,7 @@ index 80152cb..edc98ad 100644
      fallback_tried = False
      actual_model = body["model"]
      fallback_reason = None
-@@ -4647,7 +4972,7 @@ async def anthropic_messages(
+@@ -4647,7 +4986,7 @@ async def anthropic_messages(
  
      for attempt in range(max_attempts):
          try:
@@ -551,7 +569,7 @@ index 80152cb..edc98ad 100644
                  async with _shared_client_ctx(timeout=_SHARED_TIMEOUT_DEFAULT) as c:
                      async with c.stream("POST", url, headers=headers, json=body) as r:
                          if r.status_code != 200:
-@@ -4662,6 +4987,16 @@ async def anthropic_messages(
+@@ -4662,6 +5001,16 @@ async def anthropic_messages(
                                      status_code=400,
                                      content={"type": "error", "error": {"type": "invalid_request_error", "message": "上游内容安全审核未通过 (11140)，请调整提示词后重试"}},
                                  )
@@ -568,7 +586,7 @@ index 80152cb..edc98ad 100644
                              _record_rate_limit(model_name, err_str, uid=uid, status_code=r.status_code)
                              if not fallback_tried and _is_unauthorized_model_error(r.status_code, err_str) and body.get("model") in GPT_FALLBACK_MAP:
                                  fallback_tried = True
-@@ -4820,6 +5155,9 @@ async def openai_responses(
+@@ -4820,6 +5169,9 @@ async def openai_responses(
      if CONFIG.get("desensitize"):
          body = desensitize_body(body, roles=("system", "assistant"))
  
@@ -578,7 +596,7 @@ index 80152cb..edc98ad 100644
      model_name = _normalize_model_name(raw_body.get("model"))
      mapped_model = MODEL_MAP.get(model_name, model_name)
      body["model"] = mapped_model
-@@ -4938,8 +5276,9 @@ async def openai_responses(
+@@ -4938,8 +5290,9 @@ async def openai_responses(
          return resp
  
      retry_budget = rotator.get_retry_budget(model_name) if rotator else 1
@@ -589,7 +607,7 @@ index 80152cb..edc98ad 100644
      fallback_tried = False
      actual_model = body["model"]
      fallback_reason = None
-@@ -4948,7 +5287,7 @@ async def openai_responses(
+@@ -4948,7 +5301,7 @@ async def openai_responses(
  
      for attempt in range(max_attempts):
          try:
@@ -598,7 +616,7 @@ index 80152cb..edc98ad 100644
                  async with _shared_client_ctx(timeout=_SHARED_TIMEOUT_DEFAULT) as c:
                      async with c.stream("POST", url, headers=headers, json=body) as r:
                          if r.status_code != 200:
-@@ -4960,6 +5299,16 @@ async def openai_responses(
+@@ -4960,6 +5313,16 @@ async def openai_responses(
                                  _record_usage(actual_model, False, t0, error="HTTP 400 (11140 content rejected)",
                                                requested_model=model_name, fallback_reason=fallback_reason)
                                  return JSONResponse(status_code=400, content=_safe_err_raw(raw, r.status_code))

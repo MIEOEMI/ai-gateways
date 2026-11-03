@@ -23,7 +23,7 @@ gateway-dashboard —— 两个网关（Trae / WorkBuddy）的统一用量面板
 
 部署
 ----
-只对 tailnet 开放（`100.64.0.10`），见 docker-compose.yml 的 gateway-dashboard。
+只对 tailnet 开放（`100.127.177.117`），见 docker-compose.yml 的 gateway-dashboard。
 """
 
 from __future__ import annotations
@@ -46,6 +46,8 @@ CST = timezone(timedelta(hours=8))
 
 # --- 配置（全部可用环境变量覆盖，方便换端口/域名）----------------------------
 WB_BASE = os.environ.get("WB_BASE", "http://workbuddy2api:8787")
+# 国际版是**第二个实例**（不同后端 + 不同账号池），单独一个 base
+WB_INTL_BASE = os.environ.get("WB_INTL_BASE", "http://workbuddy2api-intl:8788")
 WB_KEY = os.environ.get("WORKBUDDY2API_KEY", "")
 TRAE_BASE = os.environ.get("TRAE_BASE", "http://trae2api-hub:8791")
 TRAE_KEY = os.environ.get("TRAE_API_KEY", "")
@@ -53,6 +55,8 @@ TRAE_KEY = os.environ.get("TRAE_API_KEY", "")
 TRAE_SETTINGS = os.environ.get("TRAE_SETTINGS", "/data/trae/accounts/settings.json")
 TRAE_SCHEDULER = os.environ.get("TRAE_SCHEDULER", "/data/trae/usage/scheduler.json")
 WB_USAGE = os.environ.get("WB_USAGE", "/data/wb/usage.jsonl")
+# 国际版实例的用量日志（独立数据目录）
+WB_INTL_USAGE = os.environ.get("WB_INTL_USAGE", "/data/wb-intl/usage.jsonl")
 TRAE_USAGE = os.environ.get("TRAE_USAGE", "/data/trae/usage/usage.jsonl")
 
 HTTP_TIMEOUT = float(os.environ.get("DASH_HTTP_TIMEOUT", "20"))
@@ -187,10 +191,12 @@ def fetch_trae() -> dict:
     return out
 
 
-def fetch_workbuddy() -> dict:
+def fetch_workbuddy(base: str = "") -> dict:
+    """取 WorkBuddy 实例的积分/签到。base 为空时用默认（国内版）。"""
+    base = (base or WB_BASE).rstrip("/")
     out: dict = {"ok": False, "credits": {}, "checkin": {}, "usage": {}}
     try:
-        s = _get(f"{WB_BASE}/api/usage_summary", _wb_headers())
+        s = _get(f"{base}/api/usage_summary", _wb_headers())
         if s.get("error"):
             out["error"] = str(s["error"])[:160]
         else:
@@ -207,7 +213,7 @@ def fetch_workbuddy() -> dict:
         out["error"] = f"积分接口失败: {str(exc)[:160]}"
 
     try:
-        c = _get(f"{WB_BASE}/api/checkin/status", _wb_headers())
+        c = _get(f"{base}/api/checkin/status", _wb_headers())
         data = c.get("data") if isinstance(c.get("data"), dict) else c
         if isinstance(data, dict):
             out["checkin"] = {
@@ -339,6 +345,7 @@ def _fmt_ts(at: float) -> str:
 
 def load_rows() -> list[dict]:
     rows = [_wb_row(d) for d in _read_jsonl(WB_USAGE)]
+    rows += [_wb_row(d) for d in _read_jsonl(WB_INTL_USAGE)]
     rows += [_trae_row(d) for d in _read_jsonl(TRAE_USAGE)]
     rows = [r for r in rows if r["at"] > 0]
     rows.sort(key=lambda r: r["at"], reverse=True)
@@ -437,12 +444,13 @@ def overview(window: str = "7d"):
 
     trae = _cached("trae", fetch_trae)
     wb = _cached("workbuddy", fetch_workbuddy)
+    wb_intl = _cached("workbuddy_intl", lambda: fetch_workbuddy(WB_INTL_BASE))
     rows = load_rows()
     agg = aggregate(rows, cutoff)
 
     credits_total = 0.0
     used_total = 0.0
-    for gw in (trae, wb):
+    for gw in (trae, wb, wb_intl):
         c = gw.get("credits") or {}
         credits_total += float(c.get("remain") or 0)
         used_total += float(c.get("used") or 0)
@@ -451,7 +459,7 @@ def overview(window: str = "7d"):
         "generated_at": datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S"),
         "timezone": "Asia/Shanghai",
         "window": window,
-        "gateways": {"trae": trae, "workbuddy": wb},
+        "gateways": {"trae": trae, "workbuddy": wb, "workbuddy_intl": wb_intl},
         "credits_total": {
             "remain": round(credits_total, 2),
             "used": round(used_total, 2),
@@ -652,7 +660,8 @@ function render(d){
   const g = d.gateways || {};
   $("cards").innerHTML = totalCard(d)
     + gwCard("Trae", g.trae || {}, true)
-    + gwCard("WorkBuddy", g.workbuddy || {}, false);
+    + gwCard("WorkBuddy 国内", g.workbuddy || {}, false)
+    + gwCard("WorkBuddy 国际", g.workbuddy_intl || {}, false);
 
   const src = (d.usage && d.usage.sources) || [];
   $("srcNote").textContent = src.length ? `（${src.length} 个来源，区间 ${nf(d.usage.rows)} 条请求）` : "";

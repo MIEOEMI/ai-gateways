@@ -16,7 +16,8 @@ flowchart LR
 
     subgraph gateways["本机 · docker compose"]
         T["trae2api-hub<br/>:8791"]
-        W["workbuddy2api<br/>:8787"]
+        W["workbuddy2api<br/>:8787 · 国内"]
+        WI["workbuddy2api-intl<br/>:8788 · 国际"]
         P["gateway-dashboard<br/>:8899"]
         S["workbuddy2api-sweep<br/>每日巡检"]
         K["gateway-watchdog<br/>端口自愈"]
@@ -29,6 +30,7 @@ flowchart LR
 
     A --> T
     A --> W
+    A --> WI
     B --> T
     B --> W
     C --> T
@@ -36,10 +38,12 @@ flowchart LR
     D --> P
     P -.只读.-> T
     P -.只读.-> W
+    P -.只读.-> WI
     S --> W
     K -.docker socket.-> gateways
     T --> TU
     W --> WU
+    WI --> WU
 ```
 
 ## 三个组件
@@ -48,7 +52,8 @@ flowchart LR
 |---|---|---|
 | **Trae 网关** | 8791 | 把 Trae 订阅额度转成 API。修了大模型工具调用、真流式、token 计量等问题 → [`docs/trae.md`](docs/trae.md) |
 | **WorkBuddy 网关** | 8787 | 把 WorkBuddy / CodeBuddy 订阅额度转成 API。解决了 11128 渠道校验 → [`docs/workbuddy.md`](docs/workbuddy.md) |
-| **用量面板** | 8899 | 一个页面看两边的积分、签到、请求来源、各来源消耗 → [`docs/dashboard.md`](docs/dashboard.md) |
+| **WorkBuddy 国际版** | 8788 | 同一套网关的第二个实例，后端指向国际站、用另一批账号 → [`docs/workbuddy.md`](docs/workbuddy.md#国际版单开一个实例两套额度都用上) |
+| **用量面板** | 8899 | 一个页面看各网关的积分、签到、请求来源、各来源消耗 → [`docs/dashboard.md`](docs/dashboard.md) |
 
 另外两个旁挂服务（可选）：
 

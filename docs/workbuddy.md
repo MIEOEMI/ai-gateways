@@ -139,6 +139,62 @@ code —— 这类响应根本不是 JSON；网关自身的鉴权 401 返回 JSO
 巡检脚本 `scripts/daily_sweep.py` 同步跳过异区账号，避免每天对国际号发必然 401 的
 请求、把账号写进冷却池。
 
+## 国际版：单开一个实例（两套额度都用上）
+
+国内版与国际版是两套**完全独立**的账号体系 —— token、计费、模型清单都互不相通。
+一个进程只能服务一边（选号门禁按后端区域过滤），所以想同时用两边的额度就起
+**两个实例**：
+
+| | 国内版 | 国际版 |
+|---|---|---|
+| 端口 | 8787 | **8788** |
+| 后端 | `copilot.tencent.com`（默认） | `www.workbuddy.ai` |
+| 数据目录 | `data/workbuddy/` | `data/workbuddy-intl/` |
+| 账号池 | 国内账号 | 只放国际账号 |
+
+两者除这三处之外参数完全一致（限流、脱敏、渠道守卫、轮换都一样）。
+`docker-compose.yml` 里的 `workbuddy2api-intl` 就是第二个实例，不需要时删掉即可。
+
+### 后端地址怎么切换
+
+`WORKBUDDY2API_BACKEND` 环境变量覆盖（代码里所有 URL 都由它拼出来）：
+
+```yaml
+environment:
+  - WORKBUDDY2API_BACKEND=https://www.workbuddy.ai
+```
+
+`DEFAULT_DOMAIN` 会跟着自动切换（国际实例下缺 `domain` 字段的历史账号按国际版归类），
+否则它们会被误判成异区而全部排除。
+
+### 为什么必须分实例、不能一个进程两边跑
+
+`BACKEND` 是进程级常量，选号门禁按它决定「哪些账号可用」。一个进程只能有一个
+后端，所以只能服务一个区域。想让两边共存，就得多进程 —— 这也是为什么账号池
+必须分开（`accounts.json` 里的 `active_uid` 是共享状态，两个进程写同一个文件会打架）。
+
+### 国际站的一个额外门槛
+
+国际站要求 `messages[0]` **必须是 system prompt**，否则：
+
+```json
+{"code":11128,"msg":"first message is not system prompt"}
+```
+
+`channel_guard.ensure_system_head` 已经兜住（首条不是 system 时补一句中性头）。
+注意这条也是 11128，但和「渠道校验」是**不同的子原因** —— 排查时看 `msg` 字段。
+
+### 实测
+
+```
+国际版实例  /v1/models            -> 200, 51 个模型
+            chat deepseek-v4.1-flash -> 200
+国内版实例  chat deepseek-v4.1-flash -> 429 (6004, 该模型国内账号限流中)
+```
+
+两边模型几乎一样（51 vs 57，50 个共有），差别在**账号和额度**。所以国内版限流时
+切到国际版实例即可继续用同一批模型。
+
 ## 其他端点
 
 | 端点 | 说明 |
