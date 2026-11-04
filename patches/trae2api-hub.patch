@@ -1,5 +1,5 @@
 diff --git a/trae_proxy.py b/trae_proxy.py
-index ce28f99..3fc5c43 100644
+index ce28f99..098e35f 100644
 --- a/trae_proxy.py
 +++ b/trae_proxy.py
 @@ -42,6 +42,7 @@ import ipaddress
@@ -349,7 +349,80 @@ index ce28f99..3fc5c43 100644
  
  def trae_open_chat(account, realm, body, host=None, timeout=600):
      """打开一次 llm_raw_chat（始终流式返回 SSE，协议 §六）。"""
-@@ -9153,6 +9436,19 @@ class Handler(BaseHTTPRequestHandler):
+@@ -6796,6 +7079,29 @@ def extract_session_key(headers, payload):
+ TRANSIENT_HTTP_CODES = (418, 500, 502, 503, 504)
+ TRANSIENT_MAX_RETRIES = 2          # 同账号额外重试次数（1s、2s 退避）
+ 
++# 传输层（Broken pipe / SSL EOF / 连接重置）单独一套更宽的重试预算。
++#
++# 为什么和 HTTP 错误分开计数：传输抖动是**连接层**的事，重试几乎一定成功，
++# 且单次失败不携带「这个请求本身有问题」的信息；而 5xx 往往意味着上游真的
++# 拒绝，重试多了只是烧额度。把两者绑在同一个 TRAE_TRANSIENT_MAX_RETRIES=2 上，
++# 会让「大请求上传/预填充期间上游偶发断连」只拿到 3 次机会（1s、2s 退避）。
++# 2026-11-04 实测：10 万 token 的 Agent 长会话偶发 [Errno 32] Broken pipe，
++# 3 次全撞上就直接 502，客户端表现为「agent 莫名断开」；同参数换 WorkBuddy
++# 就正常（多个账号 + 更稳的上游）。
++#
++# 默认 4 次（退避 1/2/4/8s，总计约 15s）——短于客户端重连超时，不会把
++# 「快速失败」变成「卡住」。可用 TRAE_TRANSPORT_RETRIES 覆盖。
++try:
++    TRANSIENT_TRANSPORT_MAX_RETRIES = max(
++        0, int(os.environ.get("TRAE_TRANSPORT_RETRIES", "4") or 4))
++except Exception:
++    TRANSIENT_TRANSPORT_MAX_RETRIES = 4
++
++
++def _transport_backoff(tries):
++    """传输层重试退避：1s、2s、4s、8s 封顶（指数）。"""
++    return min(2 ** max(0, int(tries) - 1), 8)
++
+ # issue #38：上游「排队」（403 + isQueued/10605 + retryAfterSeconds）时，
+ # 网关**等队列放行后重试**，而不是把排队 JSON 当错误交给客户端——客户端会把
+ # 它当成请求被拒（直接结束本轮）。三档都是可调的，默认值保守：
+@@ -7269,6 +7575,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
+         detail = ""
+         exc_obj = None
+         tries = 0
++        # 传输层重试独立计数（每个账号重置）：见 TRANSIENT_TRANSPORT_MAX_RETRIES
++        trans_tries = 0
+         refreshed = False
+         hosts = trae_core_candidates(realm)
+         host_i = 0
+@@ -7321,24 +7629,25 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
+                 time.sleep(backoff)
+                 continue
+             if _is_transient_transport(exc_obj) \
+-                    and tries < TRANSIENT_MAX_RETRIES:
++                    and trans_tries < TRANSIENT_TRANSPORT_MAX_RETRIES:
++                trans_tries += 1
++                backoff = _transport_backoff(trans_tries)
+                 if host_i + 1 < len(hosts):
+                     host_i += 1
+                     log("transient transport error on '%s' model '%s' "
+                         "(try %d/%d): %s - switching gateway host to %s"
+-                        % (account.uid[:8], model, tries + 1,
+-                           TRANSIENT_MAX_RETRIES + 1,
++                        % (account.uid[:8], model, trans_tries,
++                           TRANSIENT_TRANSPORT_MAX_RETRIES + 1,
+                            str(exc_obj)[:120], hosts[host_i]),
+                         level="WARN", tag="chat")
+                 else:
+                     log("transient transport error on '%s' model '%s' "
+                         "(try %d/%d): %s - retry in %ds"
+-                        % (account.uid[:8], model, tries + 1,
+-                           TRANSIENT_MAX_RETRIES + 1,
+-                           str(exc_obj)[:120], tries + 1),
++                        % (account.uid[:8], model, trans_tries,
++                           TRANSIENT_TRANSPORT_MAX_RETRIES + 1,
++                           str(exc_obj)[:120], backoff),
+                         level="WARN", tag="chat")
+-                tries += 1
+-                time.sleep(tries)
++                time.sleep(backoff)
+                 continue
+             break
+ 
+@@ -9153,6 +9462,19 @@ class Handler(BaseHTTPRequestHandler):
          self.send_header("Content-Length", "0")
          self.end_headers()
  
@@ -369,7 +442,7 @@ index ce28f99..3fc5c43 100644
      def do_GET(self):
          # #26：每个请求入口清空「本次实际出口」标注。self 在 keep-alive 连接上是
          # **复用**的，不清空的话后续非 chat 端点（/v1/models、/usage/*、/realm）
-@@ -9868,37 +10164,167 @@ class Handler(BaseHTTPRequestHandler):
+@@ -9868,37 +10190,167 @@ class Handler(BaseHTTPRequestHandler):
          return self._error(404, "not found", "invalid_request_error")
  
      def _handle_agent_solo(self, payload):
@@ -550,7 +623,7 @@ index ce28f99..3fc5c43 100644
      def _handle_agent_ui(self, payload):
          """Run a client_catalog Agent model through the local Trae CN UI bridge.
          Requires Trae CN running with --remote-debugging-port=9335 on this host.
-@@ -10724,6 +11150,16 @@ class Handler(BaseHTTPRequestHandler):
+@@ -10724,6 +11176,16 @@ class Handler(BaseHTTPRequestHandler):
          self.realm_reason = ""
          self.degraded_from = ""
          path = self.path.split("?")[0]
